@@ -76,6 +76,7 @@ cargo run -- get hello
 ```powershell
 cargo test       # Requires the MSVC toolchain on Windows; MinGW lacks dlltool
 cargo bench
+cargo run --example perf -- 50000 64  # Ad-hoc microbench (ops, value_size_bytes)
 ```
 
 ## TCP Server
