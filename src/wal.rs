@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const HEADER_SIZE: usize = 1 + 4 + 4;
+const HEADER_SIZE: usize = 1 + 4 + 4 + 1 + 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WalOp {
@@ -28,7 +29,11 @@ impl WalOp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WalEntry {
     /// Stores the provided UTF-8 value for the key.
-    Put { key: String, value: String },
+    Put {
+        key: String,
+        value: String,
+        expires_at: Option<SystemTime>,
+    },
     /// Removes the key from the store.
     Delete { key: String },
 }
@@ -44,6 +49,13 @@ impl WalEntry {
         match self {
             WalEntry::Put { value, .. } => value.as_bytes(),
             WalEntry::Delete { .. } => &[],
+        }
+    }
+
+    fn expires_at(&self) -> Option<SystemTime> {
+        match self {
+            WalEntry::Put { expires_at, .. } => *expires_at,
+            WalEntry::Delete { .. } => None,
         }
     }
 }
@@ -114,20 +126,15 @@ impl Wal {
         ))
     }
 
-    /// Reads the value associated with the pointer.
-    pub fn read_value(&self, pointer: ValuePointer) -> io::Result<String> {
-        let record = self.read_record(pointer.offset)?;
-        match record.entry {
-            WalEntry::Put { value, .. } => Ok(value),
-            WalEntry::Delete { .. } => Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "expected put record for pointer",
-            )),
-        }
+    /// Reads the record stored at the provided pointer.
+    pub fn read_record(&self, pointer: ValuePointer) -> io::Result<WalRecord> {
+        self.read_record_at(pointer.offset)
     }
 
     /// Loads the index by replaying the log from scratch.
-    pub fn load_index(&self) -> io::Result<(HashMap<String, ValuePointer>, u64)> {
+    pub fn load_index(
+        &self,
+    ) -> io::Result<(HashMap<String, (ValuePointer, Option<SystemTime>)>, u64)> {
         let file = match File::open(&self.path) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok((HashMap::new(), 0)),
@@ -141,13 +148,15 @@ impl Wal {
         while let Some(record) = Self::read_record_internal(&mut reader)? {
             let pointer = ValuePointer::new(offset, record.value_len, record.record_len);
             match &record.entry {
-                WalEntry::Put { key, .. } => {
-                    if let Some(previous) = index.insert(key.clone(), pointer) {
+                WalEntry::Put {
+                    key, expires_at, ..
+                } => {
+                    if let Some((previous, _)) = index.insert(key.clone(), (pointer, *expires_at)) {
                         stale += previous.record_len as u64;
                     }
                 }
                 WalEntry::Delete { key } => {
-                    if let Some(previous) = index.remove(key) {
+                    if let Some((previous, _)) = index.remove(key) {
                         stale += previous.record_len as u64;
                     }
                 }
@@ -161,8 +170,8 @@ impl Wal {
     /// Rewrites the log with the provided entries and returns the rebuilt index.
     pub fn rewrite(
         &self,
-        entries: &[(String, String)],
-    ) -> io::Result<HashMap<String, ValuePointer>> {
+        entries: &[(String, String, Option<SystemTime>)],
+    ) -> io::Result<HashMap<String, (ValuePointer, Option<SystemTime>)>> {
         let mut index = HashMap::new();
         let mut offset = 0u64;
         let temp_path = self.path.with_extension("compact");
@@ -175,16 +184,17 @@ impl Wal {
                 .truncate(true)
                 .open(&temp_path)?;
 
-            for (key, value) in entries {
+            for (key, value, expires_at) in entries {
                 let entry = WalEntry::Put {
                     key: key.clone(),
                     value: value.clone(),
+                    expires_at: *expires_at,
                 };
                 let encoded = Self::encode_entry(&entry);
                 file.write_all(&encoded)?;
                 let pointer =
                     ValuePointer::new(offset, value.as_bytes().len() as u32, encoded.len() as u32);
-                index.insert(key.clone(), pointer);
+                index.insert(key.clone(), (pointer, *expires_at));
                 offset += encoded.len() as u64;
             }
             file.flush()?;
@@ -217,7 +227,7 @@ impl Wal {
         Ok(index)
     }
 
-    fn read_record(&self, offset: u64) -> io::Result<WalRecord> {
+    fn read_record_at(&self, offset: u64) -> io::Result<WalRecord> {
         let mut file = OpenOptions::new().read(true).open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
         match Self::read_record_internal(&mut file)? {
@@ -246,6 +256,12 @@ impl Wal {
         reader.read_exact(&mut len_buf)?;
         let value_len = u32::from_le_bytes(len_buf) as usize;
 
+        let mut ttl_flag = [0u8; 1];
+        reader.read_exact(&mut ttl_flag)?;
+        let mut ttl_buf = [0u8; 8];
+        reader.read_exact(&mut ttl_buf)?;
+        let ttl_secs = u64::from_le_bytes(ttl_buf);
+
         let mut key_buf = vec![0u8; key_len];
         reader.read_exact(&mut key_buf)?;
         let key = String::from_utf8(key_buf)
@@ -265,9 +281,22 @@ impl Wal {
         }
 
         let record_len = (HEADER_SIZE + key_len + value_len) as u32;
+        let expires_at = if ttl_flag[0] == 1 {
+            Some(
+                UNIX_EPOCH
+                    .checked_add(Duration::from_secs(ttl_secs))
+                    .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "ttl overflow"))?,
+            )
+        } else {
+            None
+        };
 
         let entry = match op {
-            WalOp::Put => WalEntry::Put { key, value },
+            WalOp::Put => WalEntry::Put {
+                key,
+                value,
+                expires_at,
+            },
             WalOp::Delete => WalEntry::Delete { key },
         };
 
@@ -289,6 +318,17 @@ impl Wal {
         });
         buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+
+        let mut flag = 0u8;
+        let mut ttl = 0u64;
+        if let Some(expires_at) = entry.expires_at() {
+            if let Ok(duration) = expires_at.duration_since(UNIX_EPOCH) {
+                flag = 1;
+                ttl = duration.as_secs();
+            }
+        }
+        buf.push(flag);
+        buf.extend_from_slice(&ttl.to_le_bytes());
         buf.extend_from_slice(key);
         buf.extend_from_slice(value);
         buf

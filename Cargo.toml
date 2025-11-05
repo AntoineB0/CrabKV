@@ -8,3 +8,8 @@ name = "crabkv"
 path = "src/lib.rs"
 
 [dependencies]
+lru = "0.12"
+parking_lot = "0.12"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }

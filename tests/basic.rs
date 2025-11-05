@@ -2,7 +2,8 @@ use crabkv::CrabKv;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn put_get_delete_cycle() -> io::Result<()> {
@@ -28,6 +29,30 @@ fn put_get_delete_cycle() -> io::Result<()> {
     engine.compact()?;
     assert_eq!(engine.get("beta")?, Some("fresh".into()));
 
+    Ok(())
+}
+
+#[test]
+fn ttl_expiration() -> io::Result<()> {
+    let temp = TempDir::new()?;
+    let engine = CrabKv::builder(temp.path())
+        .default_ttl(Duration::from_secs(10))
+        .build()?;
+
+    engine.put_with_ttl(
+        "session".into(),
+        "value".into(),
+        Some(Duration::from_millis(100)),
+    )?;
+    assert_eq!(engine.get("session")?, Some("value".into()));
+
+    sleep(Duration::from_millis(150));
+    assert_eq!(engine.get("session")?, None);
+
+    // Subsequent reopen should not resurrect the expired key.
+    drop(engine);
+    let engine = CrabKv::open(temp.path())?;
+    assert_eq!(engine.get("session")?, None);
     Ok(())
 }
 
