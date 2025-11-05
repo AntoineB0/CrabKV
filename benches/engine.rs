@@ -49,7 +49,7 @@ fn bench_compaction(c: &mut Criterion) {
     c.bench_function("compaction_cycle", |b| {
         b.iter_batched(
             || {
-                let mut ctx = BenchContext::new();
+                let ctx = BenchContext::new();
                 for i in 0..2_000 {
                     let key = format!("k{i}");
                     ctx.engine.put(key.clone(), format!("value-{i}")).unwrap();
