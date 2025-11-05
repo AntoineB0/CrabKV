@@ -48,17 +48,6 @@ impl WalEntry {
     }
 }
 
-/// Metadata produced after appending an entry to the log.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AppendMetadata {
-    /// Offset where the record starts.
-    pub offset: u64,
-    /// Total record length including header and key bytes.
-    pub record_len: u32,
-    /// Length of the value payload in bytes.
-    pub value_len: u32,
-}
-
 /// Decoded record retrieved from the log.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalRecord {
@@ -73,7 +62,7 @@ pub struct WalRecord {
 }
 
 /// Write-ahead log abstraction responsible for durable persistence.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Wal {
     path: PathBuf,
 }
@@ -107,23 +96,22 @@ impl Wal {
         }
     }
 
-    /// Appends an entry to the log and returns its metadata.
-    pub fn append(&self, entry: &WalEntry) -> io::Result<AppendMetadata> {
+    /// Appends an entry to the log and returns a pointer describing it.
+    pub fn append(&self, entry: &WalEntry) -> io::Result<ValuePointer> {
         let encoded = Self::encode_entry(entry);
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&self.path)?;
-        let offset = file.metadata()?.len();
+        let offset = file.seek(SeekFrom::End(0))?;
         file.write_all(&encoded)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(AppendMetadata {
+        file.sync_data()?;
+        Ok(ValuePointer::new(
             offset,
-            record_len: encoded.len() as u32,
-            value_len: entry.value_bytes().len() as u32,
-        })
+            entry.value_bytes().len() as u32,
+            encoded.len() as u32,
+        ))
     }
 
     /// Reads the value associated with the pointer.
@@ -171,7 +159,10 @@ impl Wal {
     }
 
     /// Rewrites the log with the provided entries and returns the rebuilt index.
-    pub fn rewrite(&self, entries: &[(String, String)]) -> io::Result<HashMap<String, ValuePointer>> {
+    pub fn rewrite(
+        &self,
+        entries: &[(String, String)],
+    ) -> io::Result<HashMap<String, ValuePointer>> {
         let mut index = HashMap::new();
         let mut offset = 0u64;
         let temp_path = self.path.with_extension("compact");
@@ -191,7 +182,8 @@ impl Wal {
                 };
                 let encoded = Self::encode_entry(&entry);
                 file.write_all(&encoded)?;
-                let pointer = ValuePointer::new(offset, value.as_bytes().len() as u32, encoded.len() as u32);
+                let pointer =
+                    ValuePointer::new(offset, value.as_bytes().len() as u32, encoded.len() as u32);
                 index.insert(key.clone(), pointer);
                 offset += encoded.len() as u64;
             }
@@ -210,11 +202,16 @@ impl Wal {
                 }
                 Err(err) => {
                     fs::rename(&backup_path, &self.path)?;
+                    let _ = fs::remove_file(&temp_path);
                     return Err(err);
                 }
             }
         } else {
             fs::rename(&temp_path, &self.path)?;
+        }
+
+        if temp_path.exists() {
+            let _ = fs::remove_file(&temp_path);
         }
 
         Ok(index)
@@ -228,7 +225,10 @@ impl Wal {
                 record.offset = offset;
                 Ok(record)
             }
-            None => Err(io::Error::new(ErrorKind::UnexpectedEof, "missing record at offset")),
+            None => Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "missing record at offset",
+            )),
         }
     }
 
@@ -264,7 +264,7 @@ impl Wal {
             ));
         }
 
-    let record_len = (HEADER_SIZE + key_len + value_len) as u32;
+        let record_len = (HEADER_SIZE + key_len + value_len) as u32;
 
         let entry = match op {
             WalOp::Put => WalEntry::Put { key, value },

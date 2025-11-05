@@ -47,12 +47,11 @@ impl CrabKv {
             value,
         };
         let mut state = self.write_lock()?;
-        let metadata = state.wal.append(&entry)?;
-        let pointer = ValuePointer::new(metadata.offset, metadata.value_len, metadata.record_len);
+        let pointer = state.wal.append(&entry)?;
+        state.total_bytes += pointer.record_len as u64;
         if let Some(previous) = state.index.insert(key, pointer) {
             state.stale_bytes += previous.record_len as u64;
         }
-        state.total_bytes += metadata.record_len as u64;
         Self::maybe_compact(&mut state)
     }
 
@@ -60,10 +59,7 @@ impl CrabKv {
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
         let state = self.read_lock()?;
         match state.index.get(key) {
-            Some(pointer) => state
-                .wal
-                .read_value(*pointer)
-                .map(Some),
+            Some(pointer) => state.wal.read_value(*pointer).map(Some),
             None => Ok(None),
         }
     }
@@ -74,11 +70,11 @@ impl CrabKv {
             key: key.to_owned(),
         };
         let mut state = self.write_lock()?;
-        let metadata = state.wal.append(&entry)?;
+        let pointer = state.wal.append(&entry)?;
+        state.total_bytes += pointer.record_len as u64;
         if let Some(previous) = state.index.remove(key) {
             state.stale_bytes += previous.record_len as u64;
         }
-        state.total_bytes += metadata.record_len as u64;
         Self::maybe_compact(&mut state)
     }
 

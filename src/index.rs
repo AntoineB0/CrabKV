@@ -26,6 +26,10 @@ impl ValuePointer {
 
 impl fmt::Display for ValuePointer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "offset={}, value_len={}, record_len={}", self.offset, self.value_len, self.record_len)
+        write!(
+            f,
+            "offset={}, value_len={}, record_len={}",
+            self.offset, self.value_len, self.record_len
+        )
     }
 }
