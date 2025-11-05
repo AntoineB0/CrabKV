@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Editors and tooling
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and scratch data
+/data/
+/tests/temp-*/
+
+CrabKv_Com.md
+CrabKv_Context.md
