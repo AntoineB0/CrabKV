@@ -3,9 +3,10 @@
 use crate::index::ValuePointer;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HEADER_SIZE: usize = 1 + 4 + 4 + 1 + 8;
 
@@ -77,21 +78,37 @@ pub struct WalRecord {
 #[derive(Debug)]
 pub struct Wal {
     path: PathBuf,
+    writer: Mutex<BufWriter<File>>,
+    last_sync: Mutex<Instant>,
+    sync_interval: Option<Duration>,
+    compression: bool,
 }
 
 impl Wal {
-    /// Opens or creates the log at the given path.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    /// Opens or creates the log at the given path with optional sync interval.
+    pub fn open(
+        path: impl AsRef<Path>,
+        sync_interval: Option<Duration>,
+        compression: bool,
+    ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&path)?;
-        Ok(Self { path })
+        let writer = Mutex::new(BufWriter::new(file));
+        let last_sync = Mutex::new(Instant::now());
+        Ok(Self {
+            path,
+            writer,
+            last_sync,
+            sync_interval,
+            compression,
+        })
     }
 
     /// Returns the underlying log path.
@@ -110,20 +127,77 @@ impl Wal {
 
     /// Appends an entry to the log and returns a pointer describing it.
     pub fn append(&self, entry: &WalEntry) -> io::Result<ValuePointer> {
-        let encoded = Self::encode_entry(entry);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(&encoded)?;
-        file.sync_data()?;
+        let encoded = self.encode_entry(entry)?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::Other, "writer poisoned"))?;
+        let offset = writer.seek(SeekFrom::End(0))?;
+        writer.write_all(&encoded)?;
+
+        // Conditional sync based on interval
+        let should_sync = if let Some(interval) = self.sync_interval {
+            let mut last = self
+                .last_sync
+                .lock()
+                .map_err(|_| io::Error::new(ErrorKind::Other, "sync lock poisoned"))?;
+            if last.elapsed() >= interval {
+                *last = Instant::now();
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        if should_sync {
+            writer.flush()?;
+            writer.get_ref().sync_data()?;
+        }
+
         Ok(ValuePointer::new(
             offset,
             entry.value_bytes().len() as u32,
             encoded.len() as u32,
         ))
+    }
+
+    /// Appends multiple entries in a single batch and returns pointers for each.
+    pub fn append_batch(&self, entries: &[WalEntry]) -> io::Result<Vec<ValuePointer>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::Other, "writer poisoned"))?;
+
+        let mut pointers = Vec::with_capacity(entries.len());
+        let mut offset = writer.seek(SeekFrom::End(0))?;
+
+        for entry in entries {
+            let encoded = self.encode_entry(entry)?;
+            writer.write_all(&encoded)?;
+            pointers.push(ValuePointer::new(
+                offset,
+                entry.value_bytes().len() as u32,
+                encoded.len() as u32,
+            ));
+            offset += encoded.len() as u64;
+        }
+
+        // Always flush and sync after batch
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+        let mut last_sync = self
+            .last_sync
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::Other, "sync lock poisoned"))?;
+        *last_sync = Instant::now();
+
+        Ok(pointers)
     }
 
     /// Reads the record stored at the provided pointer.
@@ -145,7 +219,7 @@ impl Wal {
         let mut index = HashMap::new();
         let mut stale = 0u64;
 
-        while let Some(record) = Self::read_record_internal(&mut reader)? {
+        while let Some(record) = Self::read_record_internal(&mut reader, self.compression)? {
             let pointer = ValuePointer::new(offset, record.value_len, record.record_len);
             match &record.entry {
                 WalEntry::Put {
@@ -178,11 +252,12 @@ impl Wal {
         let backup_path = self.path.with_extension("backup");
 
         {
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(&temp_path)?;
+            let mut writer = BufWriter::new(file);
 
             for (key, value, expires_at) in entries {
                 let entry = WalEntry::Put {
@@ -190,15 +265,15 @@ impl Wal {
                     value: value.clone(),
                     expires_at: *expires_at,
                 };
-                let encoded = Self::encode_entry(&entry);
-                file.write_all(&encoded)?;
+                let encoded = self.encode_entry(&entry)?;
+                writer.write_all(&encoded)?;
                 let pointer =
                     ValuePointer::new(offset, value.as_bytes().len() as u32, encoded.len() as u32);
                 index.insert(key.clone(), (pointer, *expires_at));
                 offset += encoded.len() as u64;
             }
-            file.flush()?;
-            file.sync_all()?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
         }
 
         if self.path.exists() {
@@ -230,7 +305,7 @@ impl Wal {
     fn read_record_at(&self, offset: u64) -> io::Result<WalRecord> {
         let mut file = OpenOptions::new().read(true).open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
-        match Self::read_record_internal(&mut file)? {
+        match Self::read_record_internal(&mut file, self.compression)? {
             Some(mut record) => {
                 record.offset = offset;
                 Ok(record)
@@ -242,7 +317,7 @@ impl Wal {
         }
     }
 
-    fn read_record_internal<R: Read>(reader: &mut R) -> io::Result<Option<WalRecord>> {
+    fn read_record_internal<R: Read>(reader: &mut R, compression: bool) -> io::Result<Option<WalRecord>> {
         let mut op_buf = [0u8; 1];
         let read = reader.read(&mut op_buf)?;
         if read == 0 {
@@ -271,7 +346,16 @@ impl Wal {
         if matches!(op, WalOp::Put) {
             let mut value_buf = vec![0u8; value_len];
             reader.read_exact(&mut value_buf)?;
-            value = String::from_utf8(value_buf)
+            
+            let decompressed = if compression && !value_buf.is_empty() {
+                snap::raw::Decoder::new()
+                    .decompress_vec(&value_buf)
+                    .map_err(|e| io::Error::new(ErrorKind::Other, e))?
+            } else {
+                value_buf
+            };
+            
+            value = String::from_utf8(decompressed)
                 .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid utf-8 value"))?;
         } else if value_len != 0 {
             return Err(io::Error::new(
@@ -308,16 +392,27 @@ impl Wal {
         }))
     }
 
-    fn encode_entry(entry: &WalEntry) -> Vec<u8> {
+    fn encode_entry(&self, entry: &WalEntry) -> io::Result<Vec<u8>> {
         let key = entry.key_bytes();
         let value = entry.value_bytes();
-        let mut buf = Vec::with_capacity(HEADER_SIZE + key.len() + value.len());
+
+        let compressed;
+        let final_value = if self.compression && !value.is_empty() {
+            compressed = snap::raw::Encoder::new()
+                .compress_vec(value)
+                .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+            &compressed[..]
+        } else {
+            value
+        };
+
+        let mut buf = Vec::with_capacity(HEADER_SIZE + key.len() + final_value.len());
         buf.push(match entry {
             WalEntry::Put { .. } => WalOp::Put as u8,
             WalEntry::Delete { .. } => WalOp::Delete as u8,
         });
         buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(final_value.len() as u32).to_le_bytes());
 
         let mut flag = 0u8;
         let mut ttl = 0u64;
@@ -330,7 +425,7 @@ impl Wal {
         buf.push(flag);
         buf.extend_from_slice(&ttl.to_le_bytes());
         buf.extend_from_slice(key);
-        buf.extend_from_slice(value);
-        buf
+        buf.extend_from_slice(final_value);
+        Ok(buf)
     }
 }

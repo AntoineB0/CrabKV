@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn bench_put(c: &mut Criterion) {
     let mut group = c.benchmark_group("writes");
     group.sampling_mode(SamplingMode::Auto);
+    group.warm_up_time(std::time::Duration::from_secs(3));
+    group.measurement_time(std::time::Duration::from_secs(10));
     group.bench_function("sequential_put_1k", |b| {
         b.iter_batched(
             BenchContext::new,
@@ -24,7 +26,10 @@ fn bench_put(c: &mut Criterion) {
 }
 
 fn bench_get(c: &mut Criterion) {
-    c.bench_function("sequential_get_1k", |b| {
+    let mut group = c.benchmark_group("reads");
+    group.warm_up_time(std::time::Duration::from_secs(2));
+    group.measurement_time(std::time::Duration::from_secs(8));
+    group.bench_function("sequential_get_1k", |b| {
         b.iter_batched(
             || {
                 let mut ctx = BenchContext::new();
@@ -43,10 +48,14 @@ fn bench_get(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 fn bench_compaction(c: &mut Criterion) {
-    c.bench_function("compaction_cycle", |b| {
+    let mut group = c.benchmark_group("compaction");
+    group.warm_up_time(std::time::Duration::from_secs(2));
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.bench_function("compaction_cycle", |b| {
         b.iter_batched(
             || {
                 let ctx = BenchContext::new();
@@ -65,6 +74,7 @@ fn bench_compaction(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 struct BenchContext {

@@ -9,6 +9,11 @@ CrabKv is a lightweight Rust key-value store inspired by LevelDB. The engine kee
 - Optional LRU cache to keep hot keys resident without extra plumbing.
 - Per-write TTL metadata encoded in the WAL and honored during reads and compaction.
 - Manual or automatic compaction once stale bytes cross configurable heuristics.
+- **Buffered I/O with configurable fsync intervals** for reduced system call overhead.
+- **Batch WAL writes** allowing multiple entries with a single fsync.
+- **Asynchronous background compaction** to avoid blocking the write path.
+- **Optional Snappy compression** for WAL entries (transparent encode/decode).
+- **Write-back cache** for hot writes, reducing WAL I/O via explicit flush batching.
 - Ergonomic CLI plus a text-based TCP server for experimentation.
 - Criterion benchmarks and end-to-end tests covering persistence and TTL expiry.
 
@@ -118,11 +123,51 @@ fn open_engine() -> std::io::Result<CrabKv> {
     CrabKv::builder("data")
         .cache_capacity(NonZeroUsize::new(2048).unwrap())
         .default_ttl(Duration::from_secs(30))
+        .sync_interval(Duration::from_millis(100))  // Fsync every 100ms instead of per-write
+        .compression(true)                           // Enable Snappy compression
+        .async_compaction(true)                      // Background compaction thread
+        .write_back_cache(true)                      // Buffer writes in memory
         .build()
+}
+
+fn example_write_back() -> std::io::Result<()> {
+    let db = CrabKv::builder("data")
+        .write_back_cache(true)
+        .build()?;
+    
+    // Writes are buffered in memory (fast)
+    db.put("key1".into(), "value1".into())?;
+    db.put("key2".into(), "value2".into())?;
+    
+    // Explicit flush to persist buffered writes to WAL
+    db.flush()?;
+    
+    Ok(())
+}
+
+fn example_batch_writes() -> std::io::Result<()> {
+    let db = CrabKv::builder("data").build()?;
+    
+    // Batch multiple writes with a single fsync
+    let entries = vec![
+        ("key1".to_string(), "value1".to_string(), None),
+        ("key2".to_string(), "value2".to_string(), Some(Duration::from_secs(60))),
+    ];
+    db.put_batch(entries)?;
+    
+    Ok(())
 }
 ```
 
 `CrabKv` implements `Clone`, so handles can be shared between threads. Writes are serialized while reads proceed concurrently.
+
+### Performance Tuning
+
+- **Sync Interval**: Set `.sync_interval(Duration)` to batch fsyncs and trade durability for throughput. `None` (default) syncs every write.
+- **Compression**: Enable `.compression(true)` to reduce WAL size at the cost of CPU. Uses Snappy for fast compression/decompression.
+- **Async Compaction**: Enable `.async_compaction(true)` to run compaction in a background thread without blocking writes.
+- **Write-Back Cache**: Enable `.write_back_cache(true)` to buffer hot writes in memory. **Important**: Must call `db.flush()` periodically or before shutdown to persist buffered data.
+- **Batch Writes**: Use `put_batch()` to write multiple entries with a single fsync, improving throughput for bulk operations.
 
 ## Implementation Notes
 
@@ -134,7 +179,7 @@ fn open_engine() -> std::io::Result<CrabKv> {
 
 ## Roadmap
 
-- Background compaction to hide maintenance pauses.
-- Pluggable compression codecs selectable per-column family.
+- ~~Background compaction to hide maintenance pauses.~~ ✅ Implemented
+- ~~Pluggable compression codecs selectable per-column family.~~ ✅ Implemented (Snappy)
 - Snapshotting or replication hooks for multi-node deployments.
 - Additional docs live under `docs/architecture.md`, `docs/integration.md`, and `docs/faq.md`.

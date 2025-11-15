@@ -10,6 +10,8 @@ path = "src/lib.rs"
 [dependencies]
 lru = "0.12"
 parking_lot = "0.12"
+snap = "1.1.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
