@@ -1,6 +1,12 @@
-# CrabKv
+```
+   ___           _     _  __      
+  / __\ __ __ _ | |__ | |/ /_   __
+ / / | '__/ _` || '_ \| ' /\ \ / /
+/ /__| | | (_| || |_) | . \ \ V / 
+\____/_|  \__,_||_.__/|_|\_\ \_/  
+```
 
-CrabKv is a lightweight Rust key-value store inspired by LevelDB. The engine keeps writes durable via an append-only log, rebuilds its in-memory index on restart, and now ships with caching, TTL, and a small TCP front-end for remote access.
+**CrabKv** is a lightweight Rust key-value store inspired by LevelDB. The engine keeps writes durable via an append-only log, rebuilds its in-memory index on restart, and now ships with caching, TTL, and a small TCP front-end for remote access.
 
 ## Performance Overview
 
