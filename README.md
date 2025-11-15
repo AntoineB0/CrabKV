@@ -2,6 +2,20 @@
 
 CrabKv is a lightweight Rust key-value store inspired by LevelDB. The engine keeps writes durable via an append-only log, rebuilds its in-memory index on restart, and now ships with caching, TTL, and a small TCP front-end for remote access.
 
+## Performance Overview
+
+Phase 5 optimizations deliver dramatic throughput improvements:
+
+| Configuration | Throughput (writes/sec) | Speedup vs Baseline |
+|--------------|------------------------|---------------------|
+|  Baseline (no optimizations) | 759 | 1x |
+|  Buffered I/O (100ms sync) | 115,516 | **152x**  |
+|  Batch Writes (100/batch) | 75,875 | **100x**  |
+|  Write-Back Cache | 68,374 | **90x**  |
+|  **All Optimizations Combined** | **220,970** | **291x**  |
+
+> Run `cargo run --example phase5_demo` to see these optimizations in action!
+
 ## Features
 
 - Append-only write-ahead log with crash-safe rewrites on Windows and Unix.
