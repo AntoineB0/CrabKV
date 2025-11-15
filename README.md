@@ -191,9 +191,4 @@ fn example_batch_writes() -> std::io::Result<()> {
 - Compaction is triggered when the stale-to-live ratio is roughly ≥ 1/3 and the log exceeds 1 MiB, but can be forced manually.
 - Criterion benchmarks exercise writes, hits/misses, and compaction to track regressions.
 
-## Roadmap
 
-- ~~Background compaction to hide maintenance pauses.~~ ✅ Implemented
-- ~~Pluggable compression codecs selectable per-column family.~~ ✅ Implemented (Snappy)
-- Snapshotting or replication hooks for multi-node deployments.
-- Additional docs live under `docs/architecture.md`, `docs/integration.md`, and `docs/faq.md`.
